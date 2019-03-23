@@ -83,8 +83,8 @@ use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_timer::Delay;
 
 pub use crate::quinn::{
-    ConnectError, ConnectionError, ConnectionId, ServerConfig, TransportConfig, ALPN_QUIC_H3,
-    ALPN_QUIC_HTTP,
+    ConnectError, ConnectionError, ConnectionEvent, ConnectionId, ServerConfig, Transmit,
+    TransportConfig, ALPN_QUIC_H3, ALPN_QUIC_HTTP,
 };
 pub use crate::tls::{Certificate, CertificateChain, PrivateKey};
 
@@ -148,7 +148,7 @@ impl Endpoint {
             if let Some(err) = err {
                 Err(err)
             } else {
-                Ok(NewClientConnection::new(Rc::new(conn)))
+                Ok(NewClientConnection::new(Rc::new(RefCell::new(conn))))
             }
         }))
     }
@@ -232,25 +232,18 @@ impl Endpoint {
         ConnectError,
     > {
         let (send, recv) = oneshot::channel();
-        let handle = {
+        let conn = {
             let mut endpoint = self.inner.borrow_mut();
             let addr = if endpoint.ipv6 {
                 SocketAddr::V6(ensure_ipv6(*addr))
             } else {
                 *addr
             };
-            let handle =
+            let (ch, conn) =
                 endpoint
                     .inner
                     .connect(addr, transport_config, crypto_config, server_name)?;
-            endpoint.pending.insert(handle, Pending::new(Some(send)));
-            endpoint.notify();
-            handle
-        };
-        let conn = ConnectionInner {
-            endpoint: self.inner.clone(),
-            handle,
-            side: Side::Client,
+            endpoint.create_connection(ch, conn, Some(send))
         };
         Ok((recv, conn))
     }
@@ -276,17 +269,11 @@ impl Future for Driver {
         let now = Instant::now();
         loop {
             let mut keep_going = false;
-            keep_going |= endpoint.drive_recv(now, self.0.clone())?;
-            endpoint.handle_events();
-            endpoint.drive_incoming(self.0.clone());
+            keep_going |= endpoint.drive_recv(now)?;
+            endpoint.drive_incoming();
             let _ = endpoint.incoming.poll_complete();
-
-            if !endpoint.drive_send()? {
-                keep_going |= endpoint.drive_transmit(now)?;
-            }
-
-            keep_going |= endpoint.drive_timers(now)?;
-            endpoint.handle_timer_updates();
+            keep_going |= endpoint.handle_events()?;
+            endpoint.drive_send()?;
             if !keep_going {
                 break;
             }
@@ -297,13 +284,14 @@ impl Future for Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        let mut endpoint = self.0.borrow_mut();
-        for ch in endpoint.pending.values_mut() {
-            ch.fail(ConnectionError::TransportError(quinn::TransportError {
-                code: quinn::TransportErrorCode::INTERNAL_ERROR,
-                frame: None,
-                reason: "driver future was dropped".to_string(),
-            }));
+        for sender in self.0.borrow_mut().connections.values() {
+            sender
+                .unbounded_send(ConnectionEvent::Close(quinn::TransportError {
+                    code: quinn::TransportErrorCode::INTERNAL_ERROR,
+                    frame: None,
+                    reason: "driver future was dropped".to_string(),
+                }))
+                .unwrap();
         }
     }
 }
@@ -312,14 +300,14 @@ struct EndpointInner {
     log: Logger,
     socket: UdpSocket,
     inner: quinn::Endpoint,
-    outgoing: Option<quinn::Transmit>,
-    pending: FnvHashMap<ConnectionHandle, Pending>,
-    // TODO: Replace this with something custom that avoids using oneshots to cancel
-    timers: FuturesUnordered<Timer>,
-    buffered_incoming: VecDeque<ConnectionHandle>,
+    outgoing: VecDeque<quinn::Transmit>,
+    buffered_incoming: VecDeque<(ConnectionHandle, Connection)>,
     incoming: mpsc::Sender<NewConnection>,
     driver: Option<Task>,
     ipv6: bool,
+    connections: FnvHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
 }
 
 impl EndpointInner {
@@ -330,50 +318,54 @@ impl EndpointInner {
         incoming: mpsc::Sender<NewConnection>,
         ipv6: bool,
     ) -> Self {
+        let (sender, events) = mpsc::unbounded();
         Self {
             log,
             socket,
             inner,
             incoming,
             ipv6,
-            outgoing: None,
-            pending: FnvHashMap::default(),
-            timers: FuturesUnordered::new(),
+            outgoing: VecDeque::new(),
             buffered_incoming: VecDeque::new(),
             driver: None,
+            connections: FnvHashMap::default(),
+            sender,
+            events,
         }
     }
 
-    /// Wake up a blocked `Driver` task to process I/O
-    fn notify(&self) {
-        if let Some(x) = self.driver.as_ref() {
-            x.notify();
-        }
-    }
-
-    fn drive_recv(
-        &mut self,
-        now: Instant,
-        wrapped: Rc<RefCell<EndpointInner>>,
-    ) -> Result<bool, io::Error> {
+    fn drive_recv(&mut self, now: Instant) -> Result<bool, io::Error> {
         let mut buf = [0; 64 * 1024];
         let mut recvd = 0;
         loop {
             match self.socket.poll_recv(&mut buf) {
                 Ok(Async::Ready((n, addr, ecn))) => {
-                    if let Some(ch) = self.inner.handle(now, addr, ecn, (&buf[0..n]).into()) {
-                        self.pending.insert(ch, Pending::new(None));
-                        match self.incoming.poll_ready() {
-                            Ok(Async::Ready(())) => {
-                                self.incoming
-                                    .start_send(NewConnection::new(wrapped.clone(), ch))
-                                    .unwrap();
-                                self.inner.accept();
-                            }
-                            _ => {
-                                self.buffered_incoming.push_back(ch);
+                    match self.inner.handle(now, addr, ecn, (&buf[0..n]).into()) {
+                        Some((handle, ConnectionEvent::NewConnection(conn))) => {
+                            let conn = self.create_connection(handle, conn, None);
+                            let conn = Rc::new(RefCell::new(conn));
+                            match self.incoming.poll_ready() {
+                                Ok(Async::Ready(())) => {
+                                    self.incoming
+                                        .start_send(NewConnection {
+                                            driver: ConnectionDriver(conn.clone()),
+                                            connection: Connection(conn.clone()),
+                                            incoming: IncomingStreams(conn),
+                                        })
+                                        .unwrap();
+                                    self.inner.accept();
+                                }
+                                _ => {
+                                    self.buffered_incoming.push_back((handle, Connection(conn)));
+                                }
                             }
                         }
+                        Some((ch, e)) => {
+                            if let Some(sender) = self.connections.get_mut(&ch) {
+                                sender.unbounded_send(e).unwrap();
+                            }
+                        }
+                        None => {}
                     }
                 }
                 Ok(Async::NotReady) => {
@@ -396,81 +388,15 @@ impl EndpointInner {
         Ok(false)
     }
 
-    fn handle_events(&mut self) {
-        while let Some((ch, event)) = self.inner.poll() {
-            use crate::quinn::Event::*;
-            match event {
-                Connected { .. } => {
-                    let _ = self
-                        .pending
-                        .get_mut(&ch)
-                        .unwrap()
-                        .connecting
-                        .take()
-                        .map(|chan| chan.send(None));
-                }
-                ConnectionLost { reason } => {
-                    if let Some(x) = self.pending.get_mut(&ch) {
-                        x.fail(reason);
-                    }
-                }
-                StreamWritable { stream } => {
-                    if let Some(writer) = self
-                        .pending
-                        .get_mut(&ch)
-                        .unwrap()
-                        .blocked_writers
-                        .remove(&stream)
-                    {
-                        writer.notify();
-                    }
-                }
-                StreamOpened => {
-                    let pending = self.pending.get_mut(&ch).unwrap();
-                    if let Some(x) = pending.incoming_streams_reader.take() {
-                        x.notify();
-                    }
-                }
-                StreamReadable { stream } => {
-                    let pending = self.pending.get_mut(&ch).unwrap();
-                    if let Some(reader) = pending.blocked_readers.remove(&stream) {
-                        reader.notify();
-                    }
-                }
-                StreamAvailable { directionality } => {
-                    let pending = self.pending.get_mut(&ch).unwrap();
-                    let queue = match directionality {
-                        Directionality::Uni => &mut pending.uni_opening,
-                        Directionality::Bi => &mut pending.bi_opening,
-                    };
-                    while let Some(connection) = queue.pop_front() {
-                        if let Some(id) = self.inner.open(ch, directionality) {
-                            let _ = connection.send(Ok(id));
-                        } else {
-                            queue.push_front(connection);
-                            break;
-                        }
-                    }
-                }
-                StreamFinished { stream } => {
-                    let _ = self
-                        .pending
-                        .get_mut(&ch)
-                        .unwrap()
-                        .finishing
-                        .remove(&stream)
-                        .unwrap()
-                        .send(None);
-                }
-            }
-        }
-    }
-
-    fn drive_incoming(&mut self, wrapped: Rc<RefCell<EndpointInner>>) {
+    fn drive_incoming(&mut self) {
         while let Ok(Async::Ready(())) = self.incoming.poll_ready() {
-            if let Some(ch) = self.buffered_incoming.pop_front() {
+            if let Some(conn) = self.buffered_incoming.pop_front() {
                 self.incoming
-                    .start_send(NewConnection::new(wrapped.clone(), ch))
+                    .start_send(NewConnection {
+                        driver: ConnectionDriver(conn.1.clone().0),
+                        connection: conn.1.clone(),
+                        incoming: IncomingStreams((conn.1).0),
+                    })
                     .unwrap();
                 self.inner.accept();
             } else {
@@ -481,129 +407,80 @@ impl EndpointInner {
 
     fn drive_send(&mut self) -> Result<bool, io::Error> {
         let mut blocked = false;
-        if let Some(ref x) = self.outgoing {
-            match self.socket.poll_send(&x.destination, x.ecn, &x.packet) {
-                Ok(Async::Ready(_)) => {
-                    self.outgoing = None;
-                }
+        while let Some(t) = self.outgoing.pop_front() {
+            match self.socket.poll_send(&t.destination, t.ecn, &t.packet) {
+                Ok(Async::Ready(_)) => {}
                 Ok(Async::NotReady) => {
+                    self.outgoing.push_front(t);
                     blocked = true;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    self.outgoing.push_front(t);
                     blocked = true;
                 }
                 Err(e) => {
                     return Err(e);
                 }
+            }
+            if blocked {
+                return Ok(true);
             }
         }
         Ok(blocked)
     }
 
-    fn drive_transmit(&mut self, now: Instant) -> Result<bool, io::Error> {
-        let mut sent = 0;
-        while let Some(x) = self.inner.poll_transmit(now) {
-            match self.socket.poll_send(&x.destination, x.ecn, &x.packet) {
-                Ok(Async::Ready(_)) => {}
-                Ok(Async::NotReady) => {
-                    self.outgoing = Some(x);
-                    break;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    self.outgoing = Some(x);
-                    break;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-            sent += 1;
-            if sent >= IO_LOOP_BOUND {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn drive_timers(&mut self, now: Instant) -> Result<bool, io::Error> {
+    fn handle_events(&mut self) -> Result<bool, io::Error> {
+        use EndpointEvent::*;
         let mut keep_going = false;
         loop {
-            match self.timers.poll() {
-                Ok(Async::Ready(Some(Some((ch, timer))))) => {
-                    trace!(self.log, "timeout"; "timer" => ?timer);
-                    self.inner.timeout(now, ch, timer);
-                    if timer == quinn::Timer::Close {
-                        // Connection drained
-                        if let hash_map::Entry::Occupied(mut p) = self.pending.entry(ch) {
-                            if let Some(x) = p.get_mut().closing.take() {
-                                let _ = x.send(());
+            match self.events.poll() {
+                Ok(Async::Ready(Some((ch, event)))) => {
+                    match event {
+                        Proto(e) => {
+                            if let quinn::EndpointEvent::Closed { .. } = &e {
+                                self.connections.remove(&ch);
                             }
-                            if p.get().dropped {
-                                p.remove();
-                            } else {
-                                p.get_mut().drained = true;
+                            if let Some(event) = self.inner.handle_event(ch, e) {
+                                if let hash_map::Entry::Occupied(mut entry) =
+                                    self.connections.entry(ch)
+                                {
+                                    entry.get_mut().unbounded_send(event).unwrap();
+                                }
                             }
                         }
+                        Transmit(t) => self.outgoing.push_back(t),
                     }
-                    // Timeout call may have queued sends
                     keep_going = true;
                 }
-                Ok(Async::Ready(Some(None))) => {}
-                Ok(Async::Ready(None)) | Ok(Async::NotReady) => {
-                    break;
+                Ok(Async::Ready(None)) => unreachable!(),
+                Ok(Async::NotReady) => {
+                    return Ok(keep_going);
                 }
-                Err(()) => unreachable!(),
+                Err(_) => unreachable!(),
             }
         }
-        Ok(keep_going)
     }
 
-    fn handle_timer_updates(&mut self) {
-        while let Some((ch, x)) = self.inner.poll_timers() {
-            match x {
-                TimerUpdate {
-                    timer: timer @ quinn::Timer::Close,
-                    update: quinn::TimerSetting::Start(time),
-                } => {
-                    self.timers.push(Timer {
-                        ch,
-                        ty: timer,
-                        delay: Delay::new(time),
-                        cancel: None,
-                    });
-                }
-                TimerUpdate {
-                    timer,
-                    update: quinn::TimerSetting::Start(time),
-                } => {
-                    let pending = self.pending.get_mut(&ch).unwrap();
-                    let cancel = &mut pending.cancel_timers[timer as usize];
-                    if let Some(cancel) = cancel.take() {
-                        let _ = cancel.send(());
-                    }
-                    let (send, recv) = oneshot::channel();
-                    *cancel = Some(send);
-                    trace!(self.log, "timer start"; "timer" => ?timer, "time" => ?time);
-                    self.timers.push(Timer {
-                        ch,
-                        ty: timer,
-                        delay: Delay::new(time),
-                        cancel: Some(recv),
-                    });
-                }
-                TimerUpdate {
-                    timer,
-                    update: quinn::TimerSetting::Stop,
-                } => {
-                    trace!(self.log, "timer stop"; "timer" => ?timer);
-                    // If a connection was lost, we already canceled its loss/idle timers.
-                    if let Some(pending) = self.pending.get_mut(&ch) {
-                        if let Some(x) = pending.cancel_timers[timer as usize].take() {
-                            let _ = x.send(());
-                        }
-                    }
-                }
-            }
+    fn create_connection(
+        &mut self,
+        handle: ConnectionHandle,
+        conn: quinn::Connection,
+        connecting: Option<oneshot::Sender<Option<ConnectionError>>>,
+    ) -> ConnectionInner {
+        let pending = Pending::new(connecting);
+        let (conn_events_sender, conn_events) = mpsc::unbounded();
+        let endpoint_events = self.sender.clone();
+        self.connections.insert(handle, conn_events_sender);
+        ConnectionInner {
+            log: self.log.clone(),
+            side: conn.side(),
+            inner: conn,
+            handle,
+            pending,
+            driver: None,
+            timers: FuturesUnordered::new(),
+            conn_events,
+            endpoint_events,
         }
     }
 }
@@ -620,7 +497,6 @@ struct Pending {
     error: Option<ConnectionError>,
     closing: Option<oneshot::Sender<()>>,
     dropped: bool,
-    drained: bool,
 }
 
 impl Pending {
@@ -637,7 +513,6 @@ impl Pending {
             error: None,
             closing: None,
             dropped: false,
-            drained: false,
         }
     }
 
@@ -672,28 +547,18 @@ pub type Incoming = mpsc::Receiver<NewConnection>;
 
 /// A connection initiated by a remote client.
 pub struct NewConnection {
+    /// The driver for the connection
+    pub driver: ConnectionDriver,
     /// The connection itself.
     pub connection: Connection,
     /// The stream of QUIC streams initiated by the client.
     pub incoming: IncomingStreams,
 }
 
-impl NewConnection {
-    fn new(endpoint: Rc<RefCell<EndpointInner>>, handle: quinn::ConnectionHandle) -> Self {
-        let conn = Rc::new(ConnectionInner {
-            endpoint,
-            handle,
-            side: Side::Server,
-        });
-        NewConnection {
-            connection: Connection(conn.clone()),
-            incoming: IncomingStreams(conn),
-        }
-    }
-}
-
 /// A connection initiated locally.
 pub struct NewClientConnection {
+    /// The driver for the connection
+    pub driver: ConnectionDriver,
     /// The connection itself.
     pub connection: Connection,
     /// The stream of QUIC streams initiated by the client.
@@ -701,11 +566,40 @@ pub struct NewClientConnection {
 }
 
 impl NewClientConnection {
-    fn new(conn: Rc<ConnectionInner>) -> Self {
+    fn new(conn: Rc<RefCell<ConnectionInner>>) -> Self {
         Self {
+            driver: ConnectionDriver(conn.clone()),
             connection: Connection(conn.clone()),
-            incoming: IncomingStreams(conn.clone()),
+            incoming: IncomingStreams(conn),
         }
+    }
+}
+
+/// A future that drives protocol logic for a connection.
+#[derive(Clone)]
+pub struct ConnectionDriver(Rc<RefCell<ConnectionInner>>);
+
+impl Future for ConnectionDriver {
+    type Item = ();
+    type Error = io::Error;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let conn = &mut *self.0.borrow_mut();
+        if conn.driver.is_none() {
+            conn.driver = Some(task::current());
+        }
+        let now = Instant::now();
+        loop {
+            let mut keep_going = false;
+            conn.handle_app_events();
+            conn.handle_conn_events().unwrap();
+            conn.handle_endpoint_events();
+            conn.drive_transmit(now);
+            keep_going |= conn.drive_timers(now);
+            if !keep_going {
+                break;
+            }
+        }
+        Ok(Async::NotReady)
     }
 }
 
@@ -716,19 +610,18 @@ impl NewClientConnection {
 ///
 /// May be cloned to obtain another handle to the same connection.
 #[derive(Clone)]
-pub struct Connection(Rc<ConnectionInner>);
+pub struct Connection(Rc<RefCell<ConnectionInner>>);
 
 impl Connection {
     /// Initite a new outgoing unidirectional stream.
     pub fn open_uni(&self) -> impl Future<Item = SendStream, Error = ConnectionError> {
         let (send, recv) = oneshot::channel();
         {
-            let mut endpoint = self.0.endpoint.borrow_mut();
-            if let Some(x) = endpoint.inner.open(self.0.handle, Directionality::Uni) {
+            let mut conn = self.0.borrow_mut();
+            if let Some(x) = conn.inner.open(Directionality::Uni) {
                 let _ = send.send(Ok(x));
             } else {
-                let pending = endpoint.pending.get_mut(&self.0.handle).unwrap();
-                pending.uni_opening.push_back(send);
+                conn.pending.uni_opening.push_back(send);
                 // We don't notify the driver here because there's no way to ask the peer for more
                 // streams
             }
@@ -736,19 +629,18 @@ impl Connection {
         let conn = self.0.clone();
         recv.map_err(|_| unreachable!())
             .and_then(|result| result)
-            .map(move |stream| SendStream(BiStream::new(conn, stream)))
+            .map(move |stream| SendStream(BiStream::new(conn.clone(), stream)))
     }
 
     /// Initiate a new outgoing bidirectional stream.
     pub fn open_bi(&self) -> impl Future<Item = BiStream, Error = ConnectionError> {
         let (send, recv) = oneshot::channel();
         {
-            let mut endpoint = self.0.endpoint.borrow_mut();
-            if let Some(x) = endpoint.inner.open(self.0.handle, Directionality::Bi) {
+            let mut conn = self.0.borrow_mut();
+            if let Some(x) = conn.inner.open(Directionality::Bi) {
                 let _ = send.send(Ok(x));
             } else {
-                let pending = endpoint.pending.get_mut(&self.0.handle).unwrap();
-                pending.bi_opening.push_back(send);
+                conn.pending.bi_opening.push_back(send);
                 // We don't notify the driver here because there's no way to ask the peer for more
                 // streams
             }
@@ -775,18 +667,13 @@ impl Connection {
     pub fn close(&self, error_code: u16, reason: &[u8]) -> impl Future<Item = (), Error = ()> {
         let (send, recv) = oneshot::channel();
         {
-            let endpoint = &mut *self.0.endpoint.borrow_mut();
-
-            let pending = endpoint.pending.get_mut(&self.0.handle).unwrap();
+            let conn = &mut *self.0.borrow_mut();
             assert!(
-                pending.closing.is_none(),
+                conn.pending.closing.is_none(),
                 "a connection can only be closed once"
             );
-            pending.closing = Some(send);
-
-            endpoint
-                .inner
-                .close(Instant::now(), self.0.handle, error_code, reason.into());
+            conn.pending.closing = Some(send);
+            conn.inner.close(Instant::now(), error_code, reason.into());
         }
         let handle = self.clone();
         recv.then(move |_| {
@@ -798,93 +685,207 @@ impl Connection {
 
     /// The peer's UDP address.
     pub fn remote_address(&self) -> SocketAddr {
-        self.0
-            .endpoint
-            .borrow()
-            .inner
-            .connection(self.0.handle)
-            .remote()
+        self.0.borrow().inner.remote()
     }
 
-    /// The `ConnectionId`s defined for `conn` locally.
-    pub fn local_ids(&self) -> impl Iterator<Item = ConnectionId> {
-        self.0
-            .endpoint
-            .borrow()
-            .inner
-            .loc_cids(self.0.handle)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
     /// The `ConnectionId` defined for `conn` by the peer.
     pub fn remote_id(&self) -> ConnectionId {
-        self.0
-            .endpoint
-            .borrow()
-            .inner
-            .connection(self.0.handle)
-            .rem_cid()
+        self.0.borrow().inner.rem_cid()
     }
 
     /// The negotiated application protocol
     pub fn protocol(&self) -> Option<Box<[u8]>> {
-        self.0
-            .endpoint
-            .borrow()
-            .inner
-            .connection(self.0.handle)
-            .protocol()
-            .map(|x| x.into())
+        self.0.borrow().inner.protocol().map(|x| x.into())
     }
 
     // Update traffic keys spontaneously for testing purposes.
     #[doc(hidden)]
     pub fn force_key_update(&self) {
-        self.0
-            .endpoint
-            .borrow_mut()
-            .inner
-            .force_key_update(self.0.handle)
+        self.0.borrow_mut().inner.force_key_update()
     }
 }
 
 struct ConnectionInner {
-    endpoint: Rc<RefCell<EndpointInner>>,
+    log: Logger,
+    inner: quinn::Connection,
+    driver: Option<Task>,
     handle: ConnectionHandle,
+    pending: Pending,
     side: Side,
+    // TODO: Replace this with something custom that avoids using oneshots to cancel
+    timers: FuturesUnordered<Timer>,
+    conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+    endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+}
+
+impl ConnectionInner {
+    fn drive_transmit(&mut self, now: Instant) {
+        while let Some(t) = self.inner.poll_transmit(now) {
+            self.endpoint_events
+                .unbounded_send((self.handle, EndpointEvent::Transmit(t)))
+                .unwrap();
+        }
+    }
+
+    fn handle_endpoint_events(&mut self) {
+        while let Some(event) = self.inner.poll_endpoint_events() {
+            self.endpoint_events
+                .unbounded_send((self.handle, EndpointEvent::Proto(event)))
+                .unwrap();
+        }
+    }
+
+    fn handle_conn_events(&mut self) -> Result<bool, ()> {
+        loop {
+            match self.conn_events.poll() {
+                Ok(Async::Ready(Some(event))) => {
+                    self.inner.handle_event(event);
+                }
+                Ok(Async::Ready(None)) => unreachable!(),
+                Ok(Async::NotReady) => {
+                    return Ok(false);
+                }
+                Err(_) => {
+                    return Err(());
+                }
+            }
+        }
+    }
+
+    fn handle_app_events(&mut self) {
+        while let Some(event) = self.inner.poll() {
+            use crate::quinn::Event::*;
+            match event {
+                Connected { .. } => {
+                    let _ = self.pending.connecting.take().map(|chan| chan.send(None));
+                }
+                ConnectionLost { reason } => {
+                    self.pending.fail(reason);
+                }
+                StreamWritable { stream } => {
+                    if let Some(writer) = self.pending.blocked_writers.remove(&stream) {
+                        writer.notify();
+                    }
+                }
+                StreamOpened => {
+                    if let Some(x) = self.pending.incoming_streams_reader.take() {
+                        x.notify();
+                    }
+                }
+                StreamReadable { stream } => {
+                    if let Some(reader) = self.pending.blocked_readers.remove(&stream) {
+                        reader.notify();
+                    }
+                }
+                StreamAvailable { directionality } => {
+                    let queue = match directionality {
+                        Directionality::Uni => &mut self.pending.uni_opening,
+                        Directionality::Bi => &mut self.pending.bi_opening,
+                    };
+                    while let Some(connection) = queue.pop_front() {
+                        if let Some(id) = self.inner.open(directionality) {
+                            let _ = connection.send(Ok(id));
+                        } else {
+                            queue.push_front(connection);
+                            break;
+                        }
+                    }
+                }
+                StreamFinished { stream } => {
+                    let _ = self.pending.finishing.remove(&stream).unwrap().send(None);
+                }
+            }
+        }
+    }
+
+    fn drive_timers(&mut self, now: Instant) -> bool {
+        let mut keep_going = false;
+        loop {
+            match self.timers.poll() {
+                Ok(Async::Ready(Some(Some(timer)))) => {
+                    trace!(self.log, "timeout"; "timer" => ?timer);
+                    self.inner.handle_event(ConnectionEvent::Timer(now, timer));
+                    // Timeout call may have queued sends
+                    keep_going = true;
+                }
+                Ok(Async::Ready(Some(None))) => {}
+                Ok(Async::Ready(None)) | Ok(Async::NotReady) => {
+                    break;
+                }
+                Err(()) => unreachable!(),
+            }
+        }
+        keep_going
+    }
+
+    fn update_timer(&mut self, update: TimerUpdate) {
+        match update {
+            TimerUpdate {
+                timer: timer @ quinn::Timer::Close,
+                update: quinn::TimerSetting::Start(time),
+            } => {
+                self.timers.push(Timer {
+                    ty: timer,
+                    delay: Delay::new(time),
+                    cancel: None,
+                });
+            }
+            TimerUpdate {
+                timer,
+                update: quinn::TimerSetting::Start(time),
+            } => {
+                let cancel = &mut self.pending.cancel_timers[timer as usize];
+                if let Some(cancel) = cancel.take() {
+                    let _ = cancel.send(());
+                }
+                let (send, recv) = oneshot::channel();
+                *cancel = Some(send);
+                trace!(self.log, "timer start"; "timer" => ?timer, "time" => ?time);
+                self.timers.push(Timer {
+                    ty: timer,
+                    delay: Delay::new(time),
+                    cancel: Some(recv),
+                });
+            }
+            TimerUpdate {
+                timer,
+                update: quinn::TimerSetting::Stop,
+            } => {
+                trace!(self.log, "timer stop"; "timer" => ?timer);
+                // If a connection was lost, we already canceled its loss/idle timers.
+                if let Some(x) = self.pending.cancel_timers[timer as usize].take() {
+                    let _ = x.send(());
+                }
+            }
+        }
+    }
+
+    /// Wake up a blocked `Driver` task to process I/O
+    fn notify(&self) {
+        if let Some(x) = self.driver.as_ref() {
+            x.notify();
+        }
+    }
 }
 
 impl Drop for ConnectionInner {
     fn drop(&mut self) {
-        let endpoint = &mut *self.endpoint.borrow_mut();
-        if let hash_map::Entry::Occupied(mut pending) = endpoint.pending.entry(self.handle) {
-            if pending.get().drained {
-                pending.remove();
-                return;
-            }
-            pending.get_mut().dropped = true;
-            if pending.get().closing.is_none() {
-                endpoint
-                    .inner
-                    .close(Instant::now(), self.handle, 0, (&[][..]).into());
-                if let Some(x) = endpoint.driver.as_ref() {
-                    x.notify();
-                }
-            }
+        self.pending.dropped = true;
+        if self.pending.closing.is_none() {
+            self.inner.close(Instant::now(), 0, (&[][..]).into());
         }
     }
 }
 
 /// A stream of QUIC streams initiated by a remote peer.
-pub struct IncomingStreams(Rc<ConnectionInner>);
+pub struct IncomingStreams(Rc<RefCell<ConnectionInner>>);
 
 impl FuturesStream for IncomingStreams {
     type Item = NewStream;
     type Error = ConnectionError;
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let mut endpoint = self.0.endpoint.borrow_mut();
-        if let Some(x) = endpoint.inner.accept_stream(self.0.handle) {
+        let mut conn = self.0.borrow_mut();
+        if let Some(x) = conn.inner.accept() {
             let stream = BiStream::new(self.0.clone(), x);
             let stream = if x.directionality() == Directionality::Uni {
                 NewStream::Uni(RecvStream(stream))
@@ -893,11 +894,10 @@ impl FuturesStream for IncomingStreams {
             };
             return Ok(Async::Ready(Some(stream)));
         }
-        let pending = endpoint.pending.get_mut(&self.0.handle).unwrap();
-        if let Some(ref x) = pending.error {
+        if let Some(ref x) = conn.pending.error {
             Err(x.clone())
         } else {
-            pending.incoming_streams_reader = Some(task::current());
+            conn.pending.incoming_streams_reader = Some(task::current());
             Ok(Async::NotReady)
         }
     }
@@ -916,7 +916,7 @@ pub enum NewStream {
 /// Similar to a TCP connection. Each direction of data flow can be reset or finished by the
 /// sending endpoint without interfering with activity in the other direction.
 pub struct BiStream {
-    conn: Rc<ConnectionInner>,
+    conn: Rc<RefCell<ConnectionInner>>,
     stream: StreamId,
 
     // Send only
@@ -929,7 +929,7 @@ pub struct BiStream {
 }
 
 impl BiStream {
-    fn new(conn: Rc<ConnectionInner>, stream: StreamId) -> Self {
+    fn new(conn: Rc<RefCell<ConnectionInner>>, stream: StreamId) -> Self {
         Self {
             conn,
             stream,
@@ -942,39 +942,35 @@ impl BiStream {
 
 impl Write for BiStream {
     fn poll_write(&mut self, buf: &[u8]) -> Poll<usize, WriteError> {
-        let mut endpoint = self.conn.endpoint.borrow_mut();
         use crate::quinn::WriteError::*;
-        let n = match endpoint.inner.write(self.conn.handle, self.stream, buf) {
+        let mut conn = self.conn.borrow_mut();
+        let n = match conn.inner.write(self.stream, buf) {
             Ok(n) => n,
             Err(Blocked) => {
-                let pending = endpoint.pending.get_mut(&self.conn.handle).unwrap();
-                if let Some(ref x) = pending.error {
+                if let Some(ref x) = conn.pending.error {
                     return Err(WriteError::ConnectionClosed(x.clone()));
                 }
-                pending.blocked_writers.insert(self.stream, task::current());
+                conn.pending
+                    .blocked_writers
+                    .insert(self.stream, task::current());
                 return Ok(Async::NotReady);
             }
             Err(Stopped { error_code }) => {
                 return Err(WriteError::Stopped { error_code });
             }
         };
-        endpoint.notify();
+        conn.notify();
         Ok(Async::Ready(n))
     }
 
     fn poll_finish(&mut self) -> Poll<(), ConnectionError> {
-        let mut endpoint = self.conn.endpoint.borrow_mut();
         if self.finishing.is_none() {
-            endpoint.inner.finish(self.conn.handle, self.stream);
+            let mut conn = self.conn.borrow_mut();
+            conn.inner.finish(self.stream);
             let (send, recv) = oneshot::channel();
             self.finishing = Some(recv);
-            endpoint
-                .pending
-                .get_mut(&self.conn.handle)
-                .unwrap()
-                .finishing
-                .insert(self.stream, send);
-            endpoint.notify();
+            conn.pending.finishing.insert(self.stream, send);
+            conn.notify();
         }
         let r = self.finishing.as_mut().unwrap().poll().unwrap();
         match r {
@@ -988,26 +984,25 @@ impl Write for BiStream {
     }
 
     fn reset(&mut self, error_code: u16) {
-        let endpoint = &mut *self.conn.endpoint.borrow_mut();
-        endpoint
-            .inner
-            .reset(self.conn.handle, self.stream, error_code);
-        endpoint.notify();
+        let mut conn = self.conn.borrow_mut();
+        conn.inner.reset(self.stream, error_code);
+        conn.notify();
     }
 }
 
 impl Read for BiStream {
     fn poll_read_unordered(&mut self) -> Poll<(Bytes, u64), ReadError> {
-        let endpoint = &mut *self.conn.endpoint.borrow_mut();
         use crate::quinn::ReadError::*;
-        let pending = endpoint.pending.get_mut(&self.conn.handle).unwrap();
-        match endpoint.inner.read_unordered(self.conn.handle, self.stream) {
+        let mut conn = self.conn.borrow_mut();
+        match conn.inner.read_unordered(self.stream) {
             Ok((bytes, offset)) => Ok(Async::Ready((bytes, offset))),
             Err(Blocked) => {
-                if let Some(ref x) = pending.error {
+                if let Some(ref x) = conn.pending.error {
                     return Err(ReadError::ConnectionClosed(x.clone()));
                 }
-                pending.blocked_readers.insert(self.stream, task::current());
+                conn.pending
+                    .blocked_readers
+                    .insert(self.stream, task::current());
                 Ok(Async::NotReady)
             }
             Err(Reset { error_code }) => {
@@ -1023,16 +1018,17 @@ impl Read for BiStream {
     }
 
     fn poll_read(&mut self, buf: &mut [u8]) -> Poll<usize, ReadError> {
-        let endpoint = &mut *self.conn.endpoint.borrow_mut();
         use crate::quinn::ReadError::*;
-        let pending = endpoint.pending.get_mut(&self.conn.handle).unwrap();
-        match endpoint.inner.read(self.conn.handle, self.stream, buf) {
+        let mut conn = self.conn.borrow_mut();
+        match conn.inner.read(self.stream, buf) {
             Ok(n) => Ok(Async::Ready(n)),
             Err(Blocked) => {
-                if let Some(ref x) = pending.error {
+                if let Some(ref x) = conn.pending.error {
                     return Err(ReadError::ConnectionClosed(x.clone()));
                 }
-                pending.blocked_readers.insert(self.stream, task::current());
+                conn.pending
+                    .blocked_readers
+                    .insert(self.stream, task::current());
                 Ok(Async::NotReady)
             }
             Err(Reset { error_code }) => {
@@ -1048,11 +1044,9 @@ impl Read for BiStream {
     }
 
     fn stop(&mut self, error_code: u16) {
-        let endpoint = &mut *self.conn.endpoint.borrow_mut();
-        endpoint
-            .inner
-            .stop_sending(self.conn.handle, self.stream, error_code);
-        endpoint.notify();
+        let mut conn = self.conn.borrow_mut();
+        conn.inner.stop_sending(self.stream, error_code);
+        conn.notify();
         self.recvd = true;
     }
 }
@@ -1091,21 +1085,19 @@ impl AsyncWrite for BiStream {
 
 impl Drop for BiStream {
     fn drop(&mut self) {
-        let endpoint = &mut *self.conn.endpoint.borrow_mut();
-        let ours = self.stream.initiator() == self.conn.side;
+        let mut conn = self.conn.borrow_mut();
+        let ours = self.stream.initiator() == conn.side;
         let (send, recv) = match self.stream.directionality() {
             Directionality::Bi => (true, true),
             Directionality::Uni => (ours, !ours),
         };
         if send && !self.finished {
-            endpoint.inner.reset(self.conn.handle, self.stream, 0);
+            conn.inner.reset(self.stream, 0);
         }
         if recv && !self.recvd {
-            endpoint
-                .inner
-                .stop_sending(self.conn.handle, self.stream, 0);
+            conn.inner.stop_sending(self.stream, 0);
         }
-        endpoint.notify();
+        conn.notify();
     }
 }
 
@@ -1205,14 +1197,13 @@ pub fn read_to_end<T: Read>(stream: T, size_limit: usize) -> ReadToEnd<T> {
 }
 
 struct Timer {
-    ch: ConnectionHandle,
     ty: quinn::Timer,
     delay: Delay,
     cancel: Option<oneshot::Receiver<()>>,
 }
 
 impl Future for Timer {
-    type Item = Option<(ConnectionHandle, quinn::Timer)>;
+    type Item = Option<quinn::Timer>;
     type Error = (); // FIXME
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if let Some(ref mut cancel) = self.cancel {
@@ -1224,7 +1215,7 @@ impl Future for Timer {
         match self.delay.poll() {
             Err(e) => panic!("unexpected timer error: {}", e),
             Ok(Async::NotReady) => Ok(Async::NotReady),
-            Ok(Async::Ready(())) => Ok(Async::Ready(Some((self.ch, self.ty)))),
+            Ok(Async::Ready(())) => Ok(Async::Ready(Some(self.ty))),
         }
     }
 }
@@ -1367,4 +1358,9 @@ fn ensure_ipv6(x: SocketAddr) -> SocketAddrV6 {
         SocketAddr::V6(x) => x,
         SocketAddr::V4(x) => SocketAddrV6::new(x.ip().to_ipv6_mapped(), x.port(), 0, 0),
     }
+}
+
+enum EndpointEvent {
+    Proto(quinn::EndpointEvent),
+    Transmit(quinn::Transmit),
 }

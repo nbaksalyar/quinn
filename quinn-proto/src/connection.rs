@@ -515,7 +515,7 @@ impl Connection {
         self.space_mut(space).pending_acks.subtract(&info.acks);
     }
 
-    fn timeout(&mut self, now: Instant, timer: Timer) {
+    pub(crate) fn timeout(&mut self, now: Instant, timer: Timer) {
         match timer {
             Timer::Close => {
                 self.state = State::Drained;
@@ -1005,6 +1005,7 @@ impl Connection {
     pub fn handle_event(&mut self, event: ConnectionEvent) {
         use self::ConnectionEvent::*;
         match event {
+            Close(_) => unreachable!(),
             Datagram {
                 now,
                 remote,
@@ -1028,6 +1029,7 @@ impl Connection {
                     self.handle_coalesced(now, remote, ecn, data);
                 }
             }
+            NewConnection(_) => unreachable!(),
             NewIdentifiers(ids) => {
                 ids.into_iter().for_each(|(seq, cid)| {
                     self.issue_cid(seq, cid);
@@ -3237,6 +3239,7 @@ const MAX_ACK_BLOCKS: usize = 64;
 
 /// Events to be sent to the Connection
 pub enum ConnectionEvent {
+    Close(TransportError),
     Datagram {
         now: Instant,
         remote: SocketAddr,
@@ -3244,6 +3247,7 @@ pub enum ConnectionEvent {
         first_decode: PartialDecode,
         remaining: Option<BytesMut>,
     },
+    NewConnection(Connection),
     NewIdentifiers(Vec<(u64, ConnectionId)>),
     Timer(Instant, Timer),
 }
@@ -3257,6 +3261,7 @@ pub enum EndpointEvent {
     NeedIdentifiers,
     /// Stop routing connection ID for this sequence number to this `Connection`
     RetireConnectionId(u64),
+    TimerUpdate(TimerUpdate),
 }
 
 /// Encoding of I/O operations to emit on upcoming `poll_io` calls
