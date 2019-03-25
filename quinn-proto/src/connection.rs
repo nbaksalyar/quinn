@@ -1420,6 +1420,13 @@ impl Connection {
         packet: Packet,
     ) -> Result<(), TransportError> {
         debug_assert_ne!(packet.header.space(), SpaceId::Data);
+        eprintln!(
+            "PACKET<{:?}>:\nheader: {:?}\npayload size: {:?}\npayload: {:?}\n",
+            self.remote,
+            packet.header,
+            packet.payload.len(),
+            packet.payload.to_vec()
+        );
         for frame in frame::Iter::new(packet.payload.into()) {
             match frame {
                 Frame::Padding => {}
@@ -1458,10 +1465,14 @@ impl Connection {
                     self.state = State::Draining;
                     return Ok(());
                 }
-                _ => {
-                    return Err(TransportError::PROTOCOL_VIOLATION(
-                        "illegal frame type in handshake",
+                frame => {
+                    eprintln!("ILLEGAL_PACKET<{:?}>", self.remote,);
+                    let mut err = TransportError::PROTOCOL_VIOLATION(format!(
+                        "illegal frame type in handshake: {:?}",
+                        frame
                     ));
+                    err.frame = Some(frame.ty());
+                    return Err(err);
                 }
             }
         }

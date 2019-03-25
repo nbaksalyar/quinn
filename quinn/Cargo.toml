@@ -27,7 +27,7 @@ futures = "0.1.21"
 quinn-proto = { path = "../quinn-proto", version = "0.2.0" }
 rand = "0.6"
 rustls = { version = "0.15", features = ["quic"] }
-slog = "2.1"
+slog = { version = "2.1", features = ["max_level_trace", "release_max_level_warn"] }
 tokio-reactor = "0.1.1"
 tokio-io = "0.1"
 tokio-timer = "0.2.1"

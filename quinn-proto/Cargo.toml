@@ -26,7 +26,8 @@ rand = "0.6"
 ring = "0.14.1"
 rustls = { version = "0.15", features = ["quic"] }
 slab = "0.4"
-slog = "2.2"
+# slog = "2.2"
+slog = { version = "2.2", features = ["max_level_trace", "release_max_level_warn"] }
 webpki = "0.19"
 
 [dev-dependencies]
